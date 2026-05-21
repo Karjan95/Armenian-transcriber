@@ -1,30 +1,56 @@
 import { useState, useRef } from 'react';
 import { GoogleGenAI } from '@google/genai';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  AudioLines, 
-  Upload, 
-  Settings, 
-  CheckCircle2, 
-  Loader2, 
+import {
+  AudioLines,
+  Upload,
+  Settings,
+  CheckCircle2,
+  Loader2,
   Copy,
   Download,
-  Languages, 
-  Sparkles, 
-  Clock, 
-  ShieldCheck, 
+  Languages,
+  Sparkles,
+  Clock,
+  ShieldCheck,
   AlertCircle,
   FileAudio,
   ChevronRight,
-  ArrowRight
+  ArrowRight,
+  Bug,
+  ChevronDown
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { decodeAudioFile, sliceToWav, detectRepetitionLoop, isSuspiciouslyShort } from './audio';
+
+type DebugEntry = {
+  kind: 'speaker-map' | 'chunk' | 'insights' | 'info' | 'error';
+  label: string;
+  chunkIndex?: number;
+  startSec?: number;
+  endSec?: number;
+  durationSec?: number;
+  promptPreview?: string;
+  rawText?: string;
+  charCount?: number;
+  repetitionLoop?: { phrase?: string; count?: number };
+  suspiciouslyShort?: boolean;
+  errorMessage?: string;
+  timestamp: string;
+};
 
 // Helper for Tailwind classes
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+function formatTime(sec: number): string {
+  const total = Math.round(sec);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 // Model Fleet Definitions
@@ -57,8 +83,15 @@ export default function App() {
   const [transcript, setTranscript] = useState('');
   const [insights, setInsights] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
+  const [debugLog, setDebugLog] = useState<DebugEntry[]>([]);
+  const [showDebug, setShowDebug] = useState(false);
+  const [expandedDebugIdx, setExpandedDebugIdx] = useState<number | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const pushDebug = (entry: Omit<DebugEntry, 'timestamp'>) => {
+    setDebugLog((prev) => [...prev, { ...entry, timestamp: new Date().toISOString() }]);
+  };
 
   // Cost Estimation
   const selectedModelSpec = MODELS.find(m => m.id === selectedModel);
@@ -101,67 +134,111 @@ export default function App() {
     if (!file || !apiKey) return;
 
     setStatus('uploading');
-    setProgress(5);
+    setProgress(2);
     setLog(["Initializing secure data link..."]);
     setErrorMessage('');
+    setDebugLog([]);
+
+    const CHUNK_SECONDS = 600; // 10-minute chunks (smaller = safer vs hallucination loops)
 
     try {
       if (!audioDuration) {
-         throw new Error("Audio duration is still being calculated or failed to load. Please re-select the file or wait a moment.");
+        throw new Error("Audio duration is still being calculated or failed to load. Please re-select the file or wait a moment.");
       }
 
       const ai = new GoogleGenAI({ apiKey });
-      
-      addLog("Transmitting audio stream to cloud...");
-      const uploadedFile = await ai.files.upload({
-        file: file,
-        config: {
-          mimeType: file.type || 'audio/mpeg',
-          displayName: file.name
-        }
-      });
-      
-      const fileUri = uploadedFile.uri;
-      const fileName = uploadedFile.name;
 
-      setProgress(20);
-      addLog("Preparing linguistic engine...");
-      let isReady = false;
-      let attempt = 0;
-      while (!isReady) {
-        const pollFile = await ai.files.get({ name: fileName });
-        if (pollFile.state === 'ACTIVE') {
-            isReady = true;
-        } else if (pollFile.state === 'FAILED') {
-            throw new Error("Cloud indexing failed.");
-        } else {
-            attempt++;
-            if (attempt > 60) throw new Error("Cloud indexing timeout (2 minutes).");
-            await new Promise(r => setTimeout(r, 2000));
-        }
+      // Step A: decode + slice the audio locally
+      addLog("Decoding audio locally...");
+      pushDebug({ kind: 'info', label: 'Decoding audio in browser', durationSec: audioDuration });
+      const decoded = await decodeAudioFile(file);
+      pushDebug({
+        kind: 'info',
+        label: `Decoded: ${decoded.sampleRate}Hz, ${decoded.numberOfChannels}ch, ${decoded.duration.toFixed(1)}s`,
+      });
+
+      const sliceBoundaries: { start: number; end: number }[] = [];
+      for (let s = 0; s < decoded.duration; s += CHUNK_SECONDS) {
+        sliceBoundaries.push({ start: s, end: Math.min(decoded.duration, s + CHUNK_SECONDS) });
       }
 
-      // Pass 1: Speaker Profiling
+      addLog(`Audio split into ${sliceBoundaries.length} chunk(s).`);
+
+      // Step B: encode each chunk to WAV + upload to File API
+      const uploadedChunks: { uri: string; name: string; mimeType: string; start: number; end: number; durationSec: number }[] = [];
+      for (let i = 0; i < sliceBoundaries.length; i++) {
+        const { start, end } = sliceBoundaries[i];
+        const durationSec = end - start;
+
+        addLog(`Encoding & uploading chunk ${i + 1}/${sliceBoundaries.length}...`);
+        const wavBlob = sliceToWav(decoded, start, end, 16000);
+        const wavFile = new File([wavBlob], `chunk-${i + 1}.wav`, { type: 'audio/wav' });
+
+        const uploaded = await ai.files.upload({
+          file: wavFile,
+          config: { mimeType: 'audio/wav', displayName: wavFile.name },
+        });
+
+        let isReady = false;
+        let attempt = 0;
+        while (!isReady) {
+          const pollFile = await ai.files.get({ name: uploaded.name! });
+          if (pollFile.state === 'ACTIVE') {
+            isReady = true;
+          } else if (pollFile.state === 'FAILED') {
+            throw new Error(`Cloud indexing failed for chunk ${i + 1}.`);
+          } else {
+            attempt++;
+            if (attempt > 60) throw new Error(`Cloud indexing timeout for chunk ${i + 1}.`);
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
+
+        uploadedChunks.push({
+          uri: uploaded.uri!,
+          name: uploaded.name!,
+          mimeType: 'audio/wav',
+          start,
+          end,
+          durationSec,
+        });
+
+        pushDebug({
+          kind: 'info',
+          label: `Chunk ${i + 1} uploaded`,
+          chunkIndex: i + 1,
+          startSec: start,
+          endSec: end,
+          durationSec,
+        });
+
+        setProgress(5 + Math.round(((i + 1) / sliceBoundaries.length) * 15));
+      }
+
+      // Step C: Speaker map — run on the first chunk (most representative + cheaper than full file)
       setStatus('processing');
       setProgress(25);
-      addLog("Mapping speaker signatures... (Please wait, analyzing full audio context)");
+      addLog("Mapping speaker signatures...");
       setInsights("Generating Speaker Map...\n");
-      
+
+      const speakerPrompt = `You are an expert audio analyst conducting speaker diarization. Listen to the audio and identify EVERY distinct speaker.
+1. There may be 4, 5, or more different voices. Pay close attention to subtle voice changes.
+2. If a speaker introduces themselves, or if others refer to them by name, you MUST use their actual name as their label.
+3. If their name is never mentioned, label them as "Speaker 1", "Speaker 2", etc.
+4. For each identified speaker, briefly describe tone, pitch, gender, and speaking style.
+Provide a complete, exhaustive mapping of every voice heard.`;
+
+      const firstChunk = uploadedChunks[0];
       const speakerStream = await ai.models.generateContentStream({
         model: selectedModel,
         contents: [{
           parts: [
-            { fileData: { mimeType: file.type || 'audio/mpeg', fileUri: fileUri } },
-            { text: `You are an expert audio analyst conducting speaker diarization. Carefully listen to the ENTIRE audio file and identify EVERY distinct speaker.
-1. There may be 4, 5, or more different voices. Pay very close attention to subtle voice changes.
-2. If a speaker introduces themselves, or if others refer to them by name, you MUST use their actual name as their label.
-3. If their name is never mentioned, label them as "Speaker 1", "Speaker 2", etc.
-4. For each identified speaker, provide a brief description of their tone, pitch, gender, and speaking style to establish a robust signature.
-Provide a complete, exhaustive mapping of every voice heard.` }
-          ]
-        }]
+            { fileData: { mimeType: firstChunk.mimeType, fileUri: firstChunk.uri } },
+            { text: speakerPrompt },
+          ],
+        }],
       });
-      
+
       let speakerMapText = "";
       for await (const chunk of speakerStream) {
         if (chunk.text) {
@@ -170,103 +247,156 @@ Provide a complete, exhaustive mapping of every voice heard.` }
         }
       }
       const speakerMap = speakerMapText || "Standard Speaker Map";
+
+      pushDebug({
+        kind: 'speaker-map',
+        label: 'Speaker map response',
+        promptPreview: speakerPrompt,
+        rawText: speakerMapText,
+        charCount: speakerMapText.length,
+      });
       addLog("Speaker signatures mapped.");
 
-      // Pass 2: Managed Chunking
-      const CHUNK_SIZE = 900; // 15 mins chunks for better verbatim safety
-      const OVERLAP = 60; // 1 min overlap
-      const chunks = [];
-      let currentStart = 0;
-      while (currentStart < audioDuration) {
-        const currentEnd = Math.min(currentStart + CHUNK_SIZE, audioDuration);
-        chunks.push({ start: currentStart, end: currentEnd });
-        if (currentEnd >= audioDuration) break;
-        currentStart = currentEnd - OVERLAP;
-      }
-
+      // Step D: Transcribe each chunk INDEPENDENTLY (no time window guesswork — each upload IS the segment)
       let combinedTranscript = "";
-      let previousTail = "";
 
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        setProgress(30 + Math.round((i / chunks.length) * 50));
-        addLog(`Verbatim transcription part ${i + 1}/${chunks.length}...`);
+      for (let i = 0; i < uploadedChunks.length; i++) {
+        const c = uploadedChunks[i];
+        setProgress(30 + Math.round((i / uploadedChunks.length) * 55));
+        addLog(`Verbatim transcription ${i + 1}/${uploadedChunks.length}...`);
 
-        const chunkStream = await ai.models.generateContentStream({
-          model: selectedModel,
-          contents: [{
-            parts: [
-              { fileData: { mimeType: file.type || 'audio/mpeg', fileUri: fileUri } },
-              { text: `You are an expert transcriber. Transcribe the audio segment verbatim in Armenian.
+        const chunkOffsetLabel = `${formatTime(c.start)}–${formatTime(c.end)}`;
+        const chunkPrompt = `You are an expert transcriber. Transcribe THIS audio file verbatim in Armenian.
 
-Time Segment to focus on: ${Math.round(chunk.start)}s to ${Math.round(chunk.end)}s.
+This audio is segment ${i + 1}/${uploadedChunks.length} of a longer recording. The original timestamps of this segment in the full recording are ${chunkOffsetLabel}. Prefix each line with the timestamp in the ORIGINAL recording (offset = ${Math.round(c.start)}s).
+
 Speaker Labels to use: ${speakerMap}
 
-${previousTail ? `Context (The previous segment ended with these words): "${previousTail}"\nCONTINUE EXACTLY FROM WHERE THIS LEFT OFF WITHOUT REPEATING.` : ""}
+CRITICAL RULES:
+1. Transcribe ALL speech in this audio file from start to end.
+2. DO NOT REPEAT YOURSELF. If you catch yourself repeating the same phrase, STOP immediately.
+3. If a portion is silent, output "[Silence]" once and continue.
+4. Output ONLY the transcript — no preamble, no commentary.`;
 
-CRITICAL RULES TO PREVENT REPETITION ERRORS (HALLUCINATION LOOPS):
-1. ONLY transcribe from ${Math.round(chunk.start)}s to ${Math.round(chunk.end)}s.
-2. DO NOT REPEAT YOURSELF. If you find yourself caught in a loop and repeating the exact same dialogue lines multiple times, YOU MUST IMMEDIATELY STOP GENERATING.
-3. If there is silence or no clear speech at the end of the segment, DO NOT invent words or repeat previous sentences. Simply output "[Silence]" and stop.
-4. Include exact timestamps on each line.` }
-            ]
-          }],
-          config: {
-             temperature: 0.1
+        let rawChunkText = "";
+        let chunkError: string | undefined;
+        try {
+          const chunkStream = await ai.models.generateContentStream({
+            model: selectedModel,
+            contents: [{
+              parts: [
+                { fileData: { mimeType: c.mimeType, fileUri: c.uri } },
+                { text: chunkPrompt },
+              ],
+            }],
+            config: { temperature: 0.1 },
+          });
+
+          for await (const tsChunk of chunkStream) {
+            if (tsChunk.text) {
+              rawChunkText += tsChunk.text;
+              setTranscript(combinedTranscript + (i === 0 ? "" : "\n\n") + rawChunkText);
+            }
           }
+        } catch (err: unknown) {
+          chunkError = err instanceof Error ? err.message : String(err);
+        }
+
+        const repetition = detectRepetitionLoop(rawChunkText);
+        const shortFlag = isSuspiciouslyShort(rawChunkText, c.durationSec);
+
+        pushDebug({
+          kind: chunkError ? 'error' : 'chunk',
+          label: `Chunk ${i + 1} (${chunkOffsetLabel})`,
+          chunkIndex: i + 1,
+          startSec: c.start,
+          endSec: c.end,
+          durationSec: c.durationSec,
+          promptPreview: chunkPrompt,
+          rawText: rawChunkText,
+          charCount: rawChunkText.length,
+          repetitionLoop: repetition.isLoop ? { phrase: repetition.phrase, count: repetition.count } : undefined,
+          suspiciouslyShort: shortFlag,
+          errorMessage: chunkError,
         });
 
-        let currentChunkText = "";
-        for await (const tsChunk of chunkStream) {
-          if (tsChunk.text) {
-             currentChunkText += tsChunk.text;
-             setTranscript(combinedTranscript + (i === 0 ? "" : "\n\n") + currentChunkText);
-          }
-        }
-        
-        const finalizedChunkText = currentChunkText.trim();
-        if (finalizedChunkText) {
-            combinedTranscript += (i === 0 ? "" : "\n\n") + finalizedChunkText;
-            previousTail = finalizedChunkText.slice(-200).replace(/\n/g, ' ').trim();
+        const finalized = rawChunkText.trim();
+        if (finalized) {
+          combinedTranscript += (combinedTranscript ? "\n\n" : "") + `--- [${chunkOffsetLabel}] ---\n` + finalized;
         }
       }
 
       setTranscript(combinedTranscript);
-      
+
+      // Step E: Insights — text-based, from the transcript we just produced
       setStatus('analyzing');
       setProgress(90);
-      addLog("Synthesizing context...");
+      addLog("Synthesizing context from transcript...");
       setInsights((prev) => prev + "\n\n---\n\nSynthesizing context...\n");
+
+      const insightPrompt = `Below is a verbatim Armenian transcript. Produce a Critical Bilingual Analysis in BOTH Armenian [AM] and English [EN].
+For each major point, output one paragraph prefixed "[AM]" then one prefixed "[EN]".
+
+Cover: (1) executive summary, (2) key decisions and action items, (3) strategic risks or open questions.
+
+IMPORTANT: Base your analysis ONLY on what is in the transcript below. Do NOT invent details.
+
+--- TRANSCRIPT START ---
+${combinedTranscript}
+--- TRANSCRIPT END ---`;
 
       const insightStream = await ai.models.generateContentStream({
         model: selectedModel,
-        contents: [
-          {
-            parts: [
-              { fileData: { mimeType: file.type || 'audio/mpeg', fileUri: fileUri } },
-              { text: "Critical Bilingual Analysis [AM]/[EN]: summary, key actions, strategic risks." }
-            ]
-          }
-        ],
+        contents: [{ parts: [{ text: insightPrompt }] }],
       });
 
       let finalInsights = speakerMapText + "\n\n---\n\n";
+      let rawInsightText = "";
       for await (const chunk of insightStream) {
-         if (chunk.text) {
-            finalInsights += chunk.text;
-            setInsights(finalInsights);
-         }
+        if (chunk.text) {
+          rawInsightText += chunk.text;
+          finalInsights += chunk.text;
+          setInsights(finalInsights);
+        }
       }
+
+      pushDebug({
+        kind: 'insights',
+        label: 'Insights response (transcript-based)',
+        promptPreview: insightPrompt.slice(0, 500) + (insightPrompt.length > 500 ? '… [truncated]' : ''),
+        rawText: rawInsightText,
+        charCount: rawInsightText.length,
+      });
 
       setProgress(100);
       setStatus('done');
       addLog("Multi-pass process complete.");
 
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
       console.error("Transcription Error:", err);
+      pushDebug({ kind: 'error', label: 'Fatal error', errorMessage: msg });
       setStatus('error');
-      setErrorMessage(err.message || "Engine failure detected. Check browser console for details.");
+      setErrorMessage(msg || "Engine failure detected. Check browser console for details.");
     }
+  };
+
+  const downloadDebug = () => {
+    const payload = {
+      file: file ? { name: file.name, sizeBytes: file.size, type: file.type, durationSec: audioDuration } : null,
+      model: selectedModel,
+      generatedAt: new Date().toISOString(),
+      entries: debugLog,
+      finalTranscript: transcript,
+      finalInsights: insights,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'debug-trace.json';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
   return (
@@ -498,7 +628,7 @@ CRITICAL RULES TO PREVENT REPETITION ERRORS (HALLUCINATION LOOPS):
 
           {/* Output Section */}
           <AnimatePresence>
-            {(transcript || insights || status === 'done') && (
+            {(transcript || insights || debugLog.length > 0 || status === 'done') && (
               <motion.section 
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
@@ -580,6 +710,126 @@ CRITICAL RULES TO PREVENT REPETITION ERRORS (HALLUCINATION LOOPS):
                     <div className="text-td font-armenian text-base leading-relaxed whitespace-pre-wrap max-h-[500px] overflow-y-auto pr-4 scrollbar-thin scrollbar-thumb-bd">
                       {transcript}
                     </div>
+                  </div>
+                )}
+
+                {/* Debug Console */}
+                {debugLog.length > 0 && (
+                  <div className="glass-card p-6 space-y-4">
+                    <div className="flex items-center justify-between border-b border-bd pb-4">
+                      <button
+                        onClick={() => setShowDebug((v) => !v)}
+                        className="flex items-center gap-2 text-[11px] font-bold text-tm uppercase tracking-widest"
+                      >
+                        <Bug className="w-4 h-4 text-ac" />
+                        Debug Console ({debugLog.length})
+                        <ChevronDown className={cn("w-3.5 h-3.5 transition-transform", showDebug && "rotate-180")} />
+                      </button>
+                      <button
+                        onClick={downloadDebug}
+                        className="flex items-center gap-2 px-4 py-2 hover:bg-sf2 rounded-xl text-tm hover:text-tx transition-all text-[11px] font-bold border border-bd"
+                      >
+                        <Download className="w-3.5 h-3.5" /> Download debug.json
+                      </button>
+                    </div>
+
+                    {showDebug && (
+                      <div className="space-y-2 max-h-[600px] overflow-y-auto pr-2">
+                        {debugLog.map((entry, idx) => {
+                          const expanded = expandedDebugIdx === idx;
+                          const flagged = entry.kind === 'error' || entry.repetitionLoop || entry.suspiciouslyShort;
+                          return (
+                            <div
+                              key={idx}
+                              className={cn(
+                                "rounded-xl border text-[12px]",
+                                flagged ? "border-rd/30 bg-rd/5" : "border-bd bg-sf2/30"
+                              )}
+                            >
+                              <button
+                                onClick={() => setExpandedDebugIdx(expanded ? null : idx)}
+                                className="w-full flex items-center justify-between px-4 py-3 text-left"
+                              >
+                                <div className="flex items-center gap-3 min-w-0">
+                                  <span
+                                    className={cn(
+                                      "text-[9px] font-bold uppercase px-2 py-1 rounded-md tracking-wider shrink-0",
+                                      entry.kind === 'error' && "bg-rd/10 text-rd",
+                                      entry.kind === 'chunk' && "bg-ac/10 text-ac",
+                                      entry.kind === 'speaker-map' && "bg-gn/10 text-gn",
+                                      entry.kind === 'insights' && "bg-gn/10 text-gn",
+                                      entry.kind === 'info' && "bg-sf3 text-tm"
+                                    )}
+                                  >
+                                    {entry.kind}
+                                  </span>
+                                  <span className="font-bold text-tx truncate">{entry.label}</span>
+                                  {entry.charCount !== undefined && (
+                                    <span className="text-tm text-[10px] shrink-0">{entry.charCount} chars</span>
+                                  )}
+                                  {entry.repetitionLoop && (
+                                    <span className="text-rd text-[10px] font-bold shrink-0">
+                                      ⚠ loop ×{entry.repetitionLoop.count}
+                                    </span>
+                                  )}
+                                  {entry.suspiciouslyShort && (
+                                    <span className="text-rd text-[10px] font-bold shrink-0">⚠ short</span>
+                                  )}
+                                </div>
+                                <ChevronDown className={cn("w-3.5 h-3.5 text-tm transition-transform shrink-0", expanded && "rotate-180")} />
+                              </button>
+
+                              {expanded && (
+                                <div className="px-4 pb-4 space-y-3 border-t border-bd/50 pt-3">
+                                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] text-tm">
+                                    {entry.chunkIndex !== undefined && <div><b className="text-tx">Index:</b> {entry.chunkIndex}</div>}
+                                    {entry.startSec !== undefined && <div><b className="text-tx">Start:</b> {formatTime(entry.startSec)}</div>}
+                                    {entry.endSec !== undefined && <div><b className="text-tx">End:</b> {formatTime(entry.endSec)}</div>}
+                                    {entry.durationSec !== undefined && <div><b className="text-tx">Duration:</b> {entry.durationSec.toFixed(1)}s</div>}
+                                    <div className="col-span-2"><b className="text-tx">At:</b> {entry.timestamp}</div>
+                                  </div>
+
+                                  {entry.repetitionLoop && (
+                                    <div className="p-3 bg-rd/10 rounded-lg text-[11px] text-rd font-bold">
+                                      Repetition detected: phrase "{entry.repetitionLoop.phrase}" repeats {entry.repetitionLoop.count} times.
+                                    </div>
+                                  )}
+                                  {entry.suspiciouslyShort && (
+                                    <div className="p-3 bg-rd/10 rounded-lg text-[11px] text-rd font-bold">
+                                      Output is suspiciously short for {entry.durationSec?.toFixed(0)}s of audio — likely truncated by the API.
+                                    </div>
+                                  )}
+
+                                  {entry.errorMessage && (
+                                    <div className="p-3 bg-rd/10 rounded-lg text-[11px] text-rd whitespace-pre-wrap">
+                                      {entry.errorMessage}
+                                    </div>
+                                  )}
+
+                                  {entry.promptPreview && (
+                                    <details className="text-[11px]">
+                                      <summary className="cursor-pointer text-tm font-bold mb-1">Prompt sent</summary>
+                                      <pre className="bg-sf p-3 rounded-lg border border-bd whitespace-pre-wrap font-mono text-[10px] text-td max-h-48 overflow-y-auto">
+{entry.promptPreview}
+                                      </pre>
+                                    </details>
+                                  )}
+
+                                  {entry.rawText !== undefined && (
+                                    <details className="text-[11px]" open>
+                                      <summary className="cursor-pointer text-tm font-bold mb-1">Raw API response</summary>
+                                      <pre className="bg-sf p-3 rounded-lg border border-bd whitespace-pre-wrap font-armenian text-[11px] text-tx max-h-64 overflow-y-auto">
+{entry.rawText || '[empty response]'}
+                                      </pre>
+                                    </details>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 )}
               </motion.section>
