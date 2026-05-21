@@ -205,7 +205,15 @@ export default function App() {
         throw new Error("Audio duration is still being calculated or failed to load. Please re-select the file or wait a moment.");
       }
 
-      const ai = new GoogleGenAI({ apiKey });
+      // Route all Gemini calls through the Vite dev-server proxy (configured in
+      // vite.config.ts at /gemini-api). The proxy forwards to
+      // generativelanguage.googleapis.com from the Node process, so Google
+      // sees the request as server-originated and stops returning 403s on
+      // direct browser inference calls.
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: { baseUrl: `${window.location.origin}/gemini-api` },
+      });
 
       // Step A: decode + slice the audio locally
       addLog("Decoding audio locally...");
