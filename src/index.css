@@ -1,0 +1,51 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Noto+Sans+Armenian:wght@400;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-armenian: "Noto Sans Armenian", "Plus Jakarta Sans", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-bg: #F9FAFB;
+  --color-sf: #FFFFFF;
+  --color-sf2: #F3F4F6;
+  --color-sf3: #E5E7EB;
+  --color-bd: #E5E7EB;
+  --color-ac: #4F46E5;
+  --color-ac-hover: #4338CA;
+  --color-tx: #111827;
+  --color-td: #4B5563;
+  --color-tm: #9CA3AF;
+  --color-gn: #10B981;
+  --color-rd: #EF4444;
+}
+
+@layer base {
+  body {
+    @apply bg-bg text-tx font-sans antialiased;
+  }
+}
+
+.markdown-body {
+  @apply font-armenian text-base leading-relaxed space-y-6 text-td;
+}
+
+.markdown-body h4 {
+  @apply text-tx font-bold text-lg border-b border-bd pb-2 mt-8 mb-4;
+}
+
+.markdown-body ul {
+  @apply list-disc list-inside space-y-2 ml-2;
+}
+
+.markdown-body p {
+  @apply mb-4;
+}
+
+.glass-card {
+  @apply bg-sf border border-bd shadow-[0_8px_30px_rgb(0,0,0,0.04)] rounded-[24px];
+}
+
+.input-field {
+  @apply w-full bg-sf border border-bd rounded-2xl px-5 py-4 text-tx font-medium outline-none focus:ring-2 focus:ring-ac/10 focus:border-ac transition-all duration-300;
+}
