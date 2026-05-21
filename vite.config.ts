@@ -17,18 +17,6 @@ export default defineConfig(({mode}) => {
     },
     server: {
       hmr: process.env.DISABLE_HMR !== 'true',
-      proxy: {
-        // Routes all Gemini calls through Vite's dev server (Node) so Google
-        // sees them as server-originated, not browser-originated. Required
-        // because direct browser->Gemini inference calls 403 in some
-        // environments even when the same key works server-side.
-        '/gemini-api': {
-          target: 'https://generativelanguage.googleapis.com',
-          changeOrigin: true,
-          secure: true,
-          rewrite: (p) => p.replace(/^\/gemini-api/, ''),
-        },
-      },
     },
   };
 });
