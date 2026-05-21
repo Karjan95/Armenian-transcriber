@@ -38,7 +38,21 @@ type DebugEntry = {
   repetitionLoop?: { phrase?: string; count?: number };
   suspiciouslyShort?: boolean;
   errorMessage?: string;
+  finishReason?: string;
+  blockReason?: string;
+  safetyRatings?: unknown;
+  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
+  retried?: boolean;
   timestamp: string;
+};
+
+type StreamCallResult = {
+  text: string;
+  finishReason?: string;
+  blockReason?: string;
+  safetyRatings?: unknown;
+  usageMetadata?: DebugEntry['usageMetadata'];
+  errorMessage?: string;
 };
 
 // Helper for Tailwind classes
@@ -53,6 +67,21 @@ function formatTime(sec: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+// Rewrites local chunk timestamps (e.g. "00:05", "[00:05]", "[00:05.123]") to absolute by adding offsetSec.
+function rewriteTimestamps(text: string, offsetSec: number): string {
+  if (!offsetSec) return text;
+  return text.replace(/\[?(\d{1,2}):([0-5]\d)(?:[.,](\d{1,3}))?\]?/g, (match, mm, ss) => {
+    const localSec = parseInt(mm, 10) * 60 + parseInt(ss, 10);
+    if (localSec > 60 * 60) return match; // already absolute (>1h), leave alone
+    const abs = localSec + offsetSec;
+    const absMin = Math.floor(abs / 60);
+    const absSec = abs % 60;
+    const wrapped = match.startsWith('[');
+    const stamp = `${absMin.toString().padStart(2, '0')}:${absSec.toString().padStart(2, '0')}`;
+    return wrapped ? `[${stamp}]` : stamp;
+  });
+}
+
 // Model Fleet Definitions
 interface ModelSpec {
   id: string;
@@ -63,13 +92,11 @@ interface ModelSpec {
 }
 
 const MODELS: ModelSpec[] = [
-  { id: 'gemini-1.5-pro', name: '1.5 Pro', tag: 'Expert', desc: 'Highest Accuracy', rate: 1.25 },
-  { id: 'gemini-1.5-flash', name: '1.5 Flash', tag: 'Balanced', desc: 'Fast Audio Engine', rate: 0.10 },
-  { id: 'gemini-2.0-flash', name: '2.0 Flash', tag: 'Fast', desc: 'Capable Engine', rate: 0.10 },
-  { id: 'gemini-2.5-flash', name: '2.5 Flash', tag: 'Fast', desc: 'Capable Engine', rate: 0.10 },
-  { id: 'gemini-3.5-flash', name: '3.5 Flash', tag: 'Balanced', desc: 'Fast Audio Engine', rate: 0.10 },
-  { id: 'gemini-3.1-pro-preview', name: '3.1 Pro', tag: 'Expert', desc: 'Highest Accuracy', rate: 1.25 },
-  { id: 'gemini-3.1-flash-lite', name: '3.1 Flash Lite', tag: 'Instant', desc: 'Fast & Reliable', rate: 0.08 },
+  { id: 'gemini-2.5-pro',        name: '2.5 Pro',        tag: 'Expert',    desc: 'Highest accuracy',         rate: 1.25 },
+  { id: 'gemini-2.5-flash',      name: '2.5 Flash',      tag: 'Balanced',  desc: 'Best price/performance',   rate: 0.30 },
+  { id: 'gemini-2.5-flash-lite', name: '2.5 Flash Lite', tag: 'Instant',   desc: 'Cheapest & fastest',       rate: 0.10 },
+  { id: 'gemini-1.5-pro',        name: '1.5 Pro',        tag: 'Long-form', desc: '2M context, audio-friendly', rate: 1.25 },
+  { id: 'gemini-1.5-flash',      name: '1.5 Flash',      tag: 'Long-form', desc: '1M context, audio-friendly', rate: 0.10 },
 ];
 
 export default function App() {
@@ -91,6 +118,38 @@ export default function App() {
 
   const pushDebug = (entry: Omit<DebugEntry, 'timestamp'>) => {
     setDebugLog((prev) => [...prev, { ...entry, timestamp: new Date().toISOString() }]);
+  };
+
+  type StreamArgs = Parameters<GoogleGenAI['models']['generateContentStream']>[0];
+  const streamCall = async (
+    ai: GoogleGenAI,
+    args: StreamArgs,
+    onDelta?: (text: string, accumulated: string) => void
+  ): Promise<StreamCallResult> => {
+    const result: StreamCallResult = { text: '' };
+    try {
+      const stream = await ai.models.generateContentStream(args);
+      for await (const chunk of stream) {
+        const anyChunk = chunk as unknown as {
+          text?: string;
+          candidates?: { finishReason?: string; safetyRatings?: unknown }[];
+          promptFeedback?: { blockReason?: string };
+          usageMetadata?: DebugEntry['usageMetadata'];
+        };
+        if (anyChunk.text) {
+          result.text += anyChunk.text;
+          onDelta?.(anyChunk.text, result.text);
+        }
+        const cand = anyChunk.candidates?.[0];
+        if (cand?.finishReason) result.finishReason = cand.finishReason;
+        if (cand?.safetyRatings) result.safetyRatings = cand.safetyRatings;
+        if (anyChunk.promptFeedback?.blockReason) result.blockReason = anyChunk.promptFeedback.blockReason;
+        if (anyChunk.usageMetadata) result.usageMetadata = anyChunk.usageMetadata;
+      }
+    } catch (err: unknown) {
+      result.errorMessage = err instanceof Error ? err.message : String(err);
+    }
+    return result;
   };
 
   // Cost Estimation
@@ -229,23 +288,21 @@ export default function App() {
 Provide a complete, exhaustive mapping of every voice heard.`;
 
       const firstChunk = uploadedChunks[0];
-      const speakerStream = await ai.models.generateContentStream({
-        model: selectedModel,
-        contents: [{
-          parts: [
-            { fileData: { mimeType: firstChunk.mimeType, fileUri: firstChunk.uri } },
-            { text: speakerPrompt },
-          ],
-        }],
-      });
+      const speakerResult = await streamCall(
+        ai,
+        {
+          model: selectedModel,
+          contents: [{
+            parts: [
+              { fileData: { mimeType: firstChunk.mimeType, fileUri: firstChunk.uri } },
+              { text: speakerPrompt },
+            ],
+          }],
+        },
+        (_d, acc) => setInsights(acc)
+      );
 
-      let speakerMapText = "";
-      for await (const chunk of speakerStream) {
-        if (chunk.text) {
-          speakerMapText += chunk.text;
-          setInsights(speakerMapText);
-        }
-      }
+      const speakerMapText = speakerResult.text;
       const speakerMap = speakerMapText || "Standard Speaker Map";
 
       pushDebug({
@@ -254,6 +311,11 @@ Provide a complete, exhaustive mapping of every voice heard.`;
         promptPreview: speakerPrompt,
         rawText: speakerMapText,
         charCount: speakerMapText.length,
+        finishReason: speakerResult.finishReason,
+        blockReason: speakerResult.blockReason,
+        safetyRatings: speakerResult.safetyRatings,
+        usageMetadata: speakerResult.usageMetadata,
+        errorMessage: speakerResult.errorMessage,
       });
       addLog("Speaker signatures mapped.");
 
@@ -268,46 +330,47 @@ Provide a complete, exhaustive mapping of every voice heard.`;
         const chunkOffsetLabel = `${formatTime(c.start)}–${formatTime(c.end)}`;
         const chunkPrompt = `You are an expert transcriber. Transcribe THIS audio file verbatim in Armenian.
 
-This audio is segment ${i + 1}/${uploadedChunks.length} of a longer recording. The original timestamps of this segment in the full recording are ${chunkOffsetLabel}. Prefix each line with the timestamp in the ORIGINAL recording (offset = ${Math.round(c.start)}s).
+Use these speaker labels: ${speakerMap}
 
-Speaker Labels to use: ${speakerMap}
+Rules:
+1. Transcribe ALL speech in this audio file from start to end. Do not skip portions.
+2. Use timestamps RELATIVE TO THIS AUDIO FILE (start at 00:00). Format each line as "MM:SS Speaker N: <text>".
+3. Transcribe verbatim — including repeated words actually spoken by the speaker. Only stop if you start fabricating words that are NOT in the audio.
+4. If a portion is truly silent, output "[Silence]" once and continue with the next utterance.
+5. Output ONLY the transcript — no preamble, no commentary, no markdown.`;
 
-CRITICAL RULES:
-1. Transcribe ALL speech in this audio file from start to end.
-2. DO NOT REPEAT YOURSELF. If you catch yourself repeating the same phrase, STOP immediately.
-3. If a portion is silent, output "[Silence]" once and continue.
-4. Output ONLY the transcript — no preamble, no commentary.`;
+        const runCall = () =>
+          streamCall(
+            ai,
+            {
+              model: selectedModel,
+              contents: [{
+                parts: [
+                  { fileData: { mimeType: c.mimeType, fileUri: c.uri } },
+                  { text: chunkPrompt },
+                ],
+              }],
+              config: { temperature: 0.1 },
+            },
+            (_d, acc) => setTranscript(combinedTranscript + (i === 0 ? "" : "\n\n") + acc)
+          );
 
-        let rawChunkText = "";
-        let chunkError: string | undefined;
-        try {
-          const chunkStream = await ai.models.generateContentStream({
-            model: selectedModel,
-            contents: [{
-              parts: [
-                { fileData: { mimeType: c.mimeType, fileUri: c.uri } },
-                { text: chunkPrompt },
-              ],
-            }],
-            config: { temperature: 0.1 },
-          });
-
-          for await (const tsChunk of chunkStream) {
-            if (tsChunk.text) {
-              rawChunkText += tsChunk.text;
-              setTranscript(combinedTranscript + (i === 0 ? "" : "\n\n") + rawChunkText);
-            }
-          }
-        } catch (err: unknown) {
-          chunkError = err instanceof Error ? err.message : String(err);
+        let result = await runCall();
+        let retried = false;
+        if (!result.text.trim() && !result.errorMessage) {
+          addLog(`Chunk ${i + 1} returned empty — retrying once...`);
+          await new Promise((r) => setTimeout(r, 1500));
+          retried = true;
+          result = await runCall();
         }
 
+        const rawChunkText = result.text;
         const repetition = detectRepetitionLoop(rawChunkText);
         const shortFlag = isSuspiciouslyShort(rawChunkText, c.durationSec);
 
         pushDebug({
-          kind: chunkError ? 'error' : 'chunk',
-          label: `Chunk ${i + 1} (${chunkOffsetLabel})`,
+          kind: result.errorMessage || !rawChunkText ? 'error' : 'chunk',
+          label: `Chunk ${i + 1} (${chunkOffsetLabel})${retried ? ' [retried]' : ''}`,
           chunkIndex: i + 1,
           startSec: c.start,
           endSec: c.end,
@@ -317,12 +380,21 @@ CRITICAL RULES:
           charCount: rawChunkText.length,
           repetitionLoop: repetition.isLoop ? { phrase: repetition.phrase, count: repetition.count } : undefined,
           suspiciouslyShort: shortFlag,
-          errorMessage: chunkError,
+          finishReason: result.finishReason,
+          blockReason: result.blockReason,
+          safetyRatings: result.safetyRatings,
+          usageMetadata: result.usageMetadata,
+          errorMessage: result.errorMessage,
+          retried,
         });
 
-        const finalized = rawChunkText.trim();
+        const offsetSec = Math.round(c.start);
+        const rewritten = rewriteTimestamps(rawChunkText, offsetSec);
+        const finalized = rewritten.trim();
         if (finalized) {
           combinedTranscript += (combinedTranscript ? "\n\n" : "") + `--- [${chunkOffsetLabel}] ---\n` + finalized;
+        } else {
+          combinedTranscript += (combinedTranscript ? "\n\n" : "") + `--- [${chunkOffsetLabel}] ---\n[NO TRANSCRIPT RETURNED — see Debug Console]`;
         }
       }
 
@@ -345,27 +417,31 @@ IMPORTANT: Base your analysis ONLY on what is in the transcript below. Do NOT in
 ${combinedTranscript}
 --- TRANSCRIPT END ---`;
 
-      const insightStream = await ai.models.generateContentStream({
-        model: selectedModel,
-        contents: [{ parts: [{ text: insightPrompt }] }],
-      });
+      const insightPreambleLen = (speakerMapText + "\n\n---\n\n").length;
+      const insightResult = await streamCall(
+        ai,
+        {
+          model: selectedModel,
+          contents: [{ parts: [{ text: insightPrompt }] }],
+        },
+        (_d, acc) => setInsights(speakerMapText + "\n\n---\n\n" + acc)
+      );
 
-      let finalInsights = speakerMapText + "\n\n---\n\n";
-      let rawInsightText = "";
-      for await (const chunk of insightStream) {
-        if (chunk.text) {
-          rawInsightText += chunk.text;
-          finalInsights += chunk.text;
-          setInsights(finalInsights);
-        }
-      }
+      const finalInsights = speakerMapText + "\n\n---\n\n" + insightResult.text;
+      setInsights(finalInsights);
+      void insightPreambleLen;
 
       pushDebug({
-        kind: 'insights',
+        kind: insightResult.errorMessage ? 'error' : 'insights',
         label: 'Insights response (transcript-based)',
         promptPreview: insightPrompt.slice(0, 500) + (insightPrompt.length > 500 ? '… [truncated]' : ''),
-        rawText: rawInsightText,
-        charCount: rawInsightText.length,
+        rawText: insightResult.text,
+        charCount: insightResult.text.length,
+        finishReason: insightResult.finishReason,
+        blockReason: insightResult.blockReason,
+        safetyRatings: insightResult.safetyRatings,
+        usageMetadata: insightResult.usageMetadata,
+        errorMessage: insightResult.errorMessage,
       });
 
       setProgress(100);
@@ -786,8 +862,28 @@ ${combinedTranscript}
                                     {entry.startSec !== undefined && <div><b className="text-tx">Start:</b> {formatTime(entry.startSec)}</div>}
                                     {entry.endSec !== undefined && <div><b className="text-tx">End:</b> {formatTime(entry.endSec)}</div>}
                                     {entry.durationSec !== undefined && <div><b className="text-tx">Duration:</b> {entry.durationSec.toFixed(1)}s</div>}
+                                    {entry.finishReason && (
+                                      <div><b className="text-tx">finishReason:</b> <span className={entry.finishReason !== 'STOP' ? 'text-rd font-bold' : ''}>{entry.finishReason}</span></div>
+                                    )}
+                                    {entry.blockReason && <div className="text-rd"><b>blockReason:</b> {entry.blockReason}</div>}
+                                    {entry.usageMetadata?.promptTokenCount !== undefined && (
+                                      <div><b className="text-tx">In tokens:</b> {entry.usageMetadata.promptTokenCount}</div>
+                                    )}
+                                    {entry.usageMetadata?.candidatesTokenCount !== undefined && (
+                                      <div><b className="text-tx">Out tokens:</b> {entry.usageMetadata.candidatesTokenCount}</div>
+                                    )}
+                                    {entry.retried && <div className="text-ac font-bold">↻ retried</div>}
                                     <div className="col-span-2"><b className="text-tx">At:</b> {entry.timestamp}</div>
                                   </div>
+
+                                  {entry.safetyRatings ? (
+                                    <details className="text-[11px]">
+                                      <summary className="cursor-pointer text-tm font-bold mb-1">Safety ratings</summary>
+                                      <pre className="bg-sf p-3 rounded-lg border border-bd whitespace-pre-wrap font-mono text-[10px] text-td max-h-32 overflow-y-auto">
+{JSON.stringify(entry.safetyRatings, null, 2)}
+                                      </pre>
+                                    </details>
+                                  ) : null}
 
                                   {entry.repetitionLoop && (
                                     <div className="p-3 bg-rd/10 rounded-lg text-[11px] text-rd font-bold">
