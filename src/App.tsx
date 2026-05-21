@@ -210,16 +210,7 @@ export default function App() {
         throw new Error("Audio duration is still being calculated or failed to load. Please re-select the file or wait a moment.");
       }
 
-      // In local dev (`npm run dev`) route Gemini calls through the Vite
-      // proxy configured in vite.config.ts. In AI Studio's sandbox or any
-      // built deployment, use the default endpoint — AI Studio handles
-      // request origin itself.
-      const ai = new GoogleGenAI({
-        apiKey,
-        ...((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
-          ? { httpOptions: { baseUrl: `${window.location.origin}/gemini-api` } }
-          : {}),
-      });
+      const ai = new GoogleGenAI({ apiKey });
 
       // Step A: decode + slice the audio locally
       addLog("Decoding audio locally...");
@@ -523,19 +514,16 @@ ${combinedTranscript}
                 <label className="text-[11px] font-bold text-tm uppercase tracking-widest flex items-center gap-2">
                   <ShieldCheck className="w-3.5 h-3.5 text-ac" /> Secure Identity
                 </label>
-                {isInjectedKeyValid ? (
-                  <span className="text-[10px] text-gn font-bold uppercase tracking-tighter">AI Studio Key Active</span>
-                ) : !apiKey && status === 'idle' ? (
+                {!apiKey && status === 'idle' && (
                   <span className="text-[10px] text-rd animate-pulse font-bold uppercase tracking-tighter">Key Required</span>
-                ) : null}
+                )}
               </div>
               <input
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder={isInjectedKeyValid ? "Using AI Studio injected key" : "Paste Gemini API Key from aistudio.google.com/apikey..."}
-                disabled={isInjectedKeyValid}
-                className="input-field shadow-sm disabled:opacity-60 disabled:cursor-not-allowed"
+                placeholder="Paste Gemini API Key from aistudio.google.com/apikey..."
+                className="input-field shadow-sm"
               />
             </div>
 
