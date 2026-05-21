@@ -16,9 +16,19 @@ export default defineConfig(({mode}) => {
       },
     },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
+      proxy: {
+        // Routes all Gemini calls through Vite's dev server (Node) so Google
+        // sees them as server-originated, not browser-originated. Required
+        // because direct browser->Gemini inference calls 403 in some
+        // environments even when the same key works server-side.
+        '/gemini-api': {
+          target: 'https://generativelanguage.googleapis.com',
+          changeOrigin: true,
+          secure: true,
+          rewrite: (p) => p.replace(/^\/gemini-api/, ''),
+        },
+      },
     },
   };
 });

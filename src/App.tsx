@@ -100,7 +100,12 @@ const MODELS: ModelSpec[] = [
 ];
 
 export default function App() {
-  const [apiKey, setApiKey] = useState('');
+  // AI Studio injects GEMINI_API_KEY at runtime (via vite.config.ts define).
+  // When present, use it — that key is the one authorized for AI Studio's
+  // app sandbox. Otherwise fall back to the UI input for local dev.
+  const injectedKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || '';
+  const isInjectedKeyValid = injectedKey && injectedKey !== 'MY_GEMINI_API_KEY';
+  const [apiKey, setApiKey] = useState(isInjectedKeyValid ? injectedKey : '');
   const [selectedModel, setSelectedModel] = useState(MODELS[0].id);
   const [file, setFile] = useState<File | null>(null);
   const [audioDuration, setAudioDuration] = useState(0);
@@ -205,7 +210,16 @@ export default function App() {
         throw new Error("Audio duration is still being calculated or failed to load. Please re-select the file or wait a moment.");
       }
 
-      const ai = new GoogleGenAI({ apiKey });
+      // In local dev (`npm run dev`) route Gemini calls through the Vite
+      // proxy configured in vite.config.ts. In AI Studio's sandbox or any
+      // built deployment, use the default endpoint — AI Studio handles
+      // request origin itself.
+      const ai = new GoogleGenAI({
+        apiKey,
+        ...((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
+          ? { httpOptions: { baseUrl: `${window.location.origin}/gemini-api` } }
+          : {}),
+      });
 
       // Step A: decode + slice the audio locally
       addLog("Decoding audio locally...");
@@ -509,16 +523,19 @@ ${combinedTranscript}
                 <label className="text-[11px] font-bold text-tm uppercase tracking-widest flex items-center gap-2">
                   <ShieldCheck className="w-3.5 h-3.5 text-ac" /> Secure Identity
                 </label>
-                {!apiKey && status === 'idle' && (
+                {isInjectedKeyValid ? (
+                  <span className="text-[10px] text-gn font-bold uppercase tracking-tighter">AI Studio Key Active</span>
+                ) : !apiKey && status === 'idle' ? (
                   <span className="text-[10px] text-rd animate-pulse font-bold uppercase tracking-tighter">Key Required</span>
-                )}
+                ) : null}
               </div>
-              <input 
+              <input
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder="Paste Gemini Cloud API Key..."
-                className="input-field shadow-sm"
+                placeholder={isInjectedKeyValid ? "Using AI Studio injected key" : "Paste Gemini API Key from aistudio.google.com/apikey..."}
+                disabled={isInjectedKeyValid}
+                className="input-field shadow-sm disabled:opacity-60 disabled:cursor-not-allowed"
               />
             </div>
 
